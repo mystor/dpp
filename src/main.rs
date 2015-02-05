@@ -25,16 +25,19 @@ enum Hunk {
 
     // Notably absent:
     // Include(Atom) -> IO in Rust is super unstable right now, so I'm avoiding dealing with it
-    // Macro(Atom, Vec<Atom>, Vec<Hunk>) -> Macros which accept arguments (I may add this to the parser later)
 
     Define(Atom, Vec<Hunk>), // #[define a ...], binds a to the ...
+    UnDefine(Atom), // #[undefine a], unbinds a
+    Macro(Atom, Vec<Atom>, Vec<Hunk>), // #[macro(a, b, c)] ... #[endmacro]
     Expand(Atom), // #a => maps to whatever a is bound to
+    Invoke(Atom, Vec<Vec<Hunk>>), // #a(a, b, c) => maps to the macro a, called with a, b, c
     If(Atom, Vec<Hunk>, Vec<Hunk>), // #[if x] ... #[else] ... #[endif]
 
     // These hunks are technically invalid, and can't be used for anything
     // They are used as values to be passed around while parsing the structure
     Else,
-    EndIf
+    EndIf,
+    EndMacro
 }
 
 // Some predicates which are used to determine when to stop parsing directives
@@ -56,6 +59,24 @@ fn until_else_endif_pred(hunk: &Hunk) -> bool {
     match *hunk {
         Hunk::EndIf => true,
         Hunk::Else => true,
+        _ => false
+    }
+}
+
+fn until_endmacro_pred(hunk: &Hunk) -> bool {
+    match *hunk {
+        Hunk::EndMacro => true,
+        _ => false
+    }
+}
+
+fn until_comma_rparen_pred(hunk: &Hunk) -> bool {
+    // TODO(michael): This function currently has the problem of stopping on RPARENs or commas inside the body of
+    // a macro argument, as the lexer doesn't understand/respect () matching. It's too big of a problem to tackle
+    // right now, but needs to be tackled at some point for dpp to be useful
+    match *hunk {
+        Hunk::Tok(COMMA) => true,
+        Hunk::Tok(RPAREN) => true,
         _ => false
     }
 }
@@ -108,6 +129,61 @@ fn parse_directive(state: &mut State, ty: &Atom, body: Vec<Hunk>) -> Result<Hunk
                 Err(format!("Can only #[define] idents!"))
             }
         }
+        "undefine" => {
+            if let Hunk::Tok(IDENT(ref atom)) = body[0] {
+                if body.len() == 1 {
+                    Ok(Hunk::UnDefine(atom.clone()))
+                } else {
+                    Err(format!("Can only #[undefine] one ident!"))
+                }
+            } else {
+                Err(format!("Can only #[undefine] idents!"))
+            }
+        }
+        "macro" => {
+            if let Hunk::Tok(IDENT(ref name)) = body[0] {
+                match body[1] { Hunk::Tok(LPAREN) => (), _ => return Err(format!("Expected ( after macro")) }
+                let mut args = Vec::new();
+
+                let mut idx = 2;
+                while idx < body.len() - 1 {
+                    if let Hunk::Tok(IDENT(ref atom)) = body[idx] { // The variable's name
+                        args.push(atom.clone());
+                        match body[idx+1] {
+                            Hunk::Tok(COMMA) => { idx += 2; continue }
+                            Hunk::Tok(RPAREN) => {
+                                if idx+2 == body.len() { // The ) must be the last character in the body
+                                    let mut body = try!(parse_groups(state, until_endmacro_pred));
+                                    return match body.pop() {
+                                        Some(Hunk::EndMacro) => {
+                                            Ok(Hunk::Macro(name.clone(), args, body))
+                                        }
+                                        _ => {
+                                            Err(format!("Unexpected end of file while parsing macro body"))
+                                        }
+                                    }
+                                } else {
+                                    return Err(format!("In macro definition, no elements allowed after )"));
+                                }
+                            }
+                            _ => return Err(format!("Unexpected token in macro definition"))
+                        }
+                    } else {
+                        return Err(format!("Expected argument name in macro definition!"));
+                    }
+                }
+                Err(format!("Unexpected end of macro definition directive"))
+            } else {
+                Err(format!("Expected macro name after 'macro' in macro definition"))
+            }
+        }
+        "endmacro" => {
+            if body.is_empty() {
+                Ok(Hunk::EndMacro)
+            } else {
+                Err(format!("EndMacro directive takes no parameters"))
+            }
+        }
         _ => Err(format!("Unrecognized directive: {:?}", ty))
     }
 }
@@ -131,7 +207,29 @@ fn parse_group(state: &mut State) -> Result<Hunk, String> {
                     }
                 },
                 Some(&IDENT(ref atom)) => {
-                    Ok(Hunk::Expand(atom.clone()))
+                    match state.peek() {
+                        Some(&LPAREN) => {
+                            state.eat(); // eat the (
+                            let mut args = Vec::new();
+                            loop {
+                                let mut arg = try!(parse_groups(state, until_comma_rparen_pred));
+                                match arg.pop() {
+                                    Some(Hunk::Tok(COMMA)) => {
+                                        args.push(arg);
+                                    }
+                                    Some(Hunk::Tok(RPAREN)) => {
+                                        args.push(arg);
+                                        break;
+                                    }
+                                    _ => return Err(format!("Unexpected end of file while parsing macro invocation"))
+                                }
+                            }
+                            Ok(Hunk::Invoke(atom.clone(), args))
+                        }
+                        _ => {
+                            Ok(Hunk::Expand(atom.clone()))
+                        }
+                    }
                 },
                 _ => Err(format!("Expected [ or IDENT after #"))
             }
@@ -164,11 +262,21 @@ fn main() {
 let id = fn (x) { x };
 #[define number 5]
 
+#[undefine compose_id]
+
 let id2 = #[if compose_id] id(id) #[else] id #[endif];
 
 let a = id2(#number);
 #[define number 10]
-let b = id2(#number); "#;
+let b = id2(#number);
+
+#[macro foo(bar, baz, quxx)]
+let #bar = #baz * #quxx;
+#[endmacro]
+
+#foo(apples, b * 3, #number)
+
+"#;
 
     let lexed = lexer::lex(test_code).unwrap();
     let groups = parse_groups(&mut State::new(lexed.as_slice()), never_pred).unwrap();
