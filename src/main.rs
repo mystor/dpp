@@ -2,6 +2,7 @@
 
 extern crate duckyc_syntax;
 
+use std::collections::HashMap;
 use duckyc_syntax::lexer::{self, Token};
 use duckyc_syntax::lexer::Token::*;
 use duckyc_syntax::parser::State;
@@ -256,6 +257,31 @@ fn parse_groups(state: &mut State, done_pred: fn(&Hunk) -> bool) -> Result<Vec<H
     Ok(hunks)
 }
 
+struct RunBlob {
+    vars: HashMap<Atom, Vec<Hunk>>
+}
+
+fn run(groups: &Vec<Hunk>) {
+    let mut blob = RunBlob { vars: HashMap::new() };
+    for group in groups.iter() {
+        match *group {
+            Hunk::Tok(ref x) => println!("{}", x),
+            Hunk::Define(ref atom, ref body) => {
+                blob.vars.insert(atom.clone(), body.clone());
+            }
+            Hunk::UnDefine(ref atom) => {
+                blob.vars.remove(atom);
+            }
+            Hunk::Expand(ref atom) => {
+                let hunks = blob.vars.get(atom);
+
+
+            }
+            _ => {}
+        }
+    }
+}
+
 fn main() {
     let test_code = r#"
 #[define compose_id]
@@ -275,13 +301,10 @@ let #bar = #baz * #quxx;
 #[endmacro]
 
 #foo(apples, b * 3, #number)
-
 "#;
 
     let lexed = lexer::lex(test_code).unwrap();
     let groups = parse_groups(&mut State::new(lexed.as_slice()), never_pred).unwrap();
 
-    for group in groups.iter() {
-        println!("{:?}", group);
-    }
+    run(&groups);
 }
